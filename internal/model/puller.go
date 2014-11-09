@@ -26,8 +26,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/AudriusButkevicius/lfu-go"
-
 	"github.com/syncthing/syncthing/internal/config"
 	"github.com/syncthing/syncthing/internal/events"
 	"github.com/syncthing/syncthing/internal/osutil"
@@ -608,36 +606,20 @@ nextFile:
 			continue nextFile
 		}
 
-		evictionChan := make(chan lfu.Eviction)
-
-		fdCache := lfu.New()
-		fdCache.UpperBound = 50
-		fdCache.LowerBound = 20
-		fdCache.EvictionChannel = evictionChan
-
-		go func() {
-			for item := range evictionChan {
-				item.Value.(*os.File).Close()
-			}
-		}()
+		folderRoots := map[string]string{}
+		p.model.fmut.RLock()
+		for folder, cfg := range p.model.folderCfgs {
+			folderRoots[folder] = cfg.Path
+		}
+		p.model.fmut.RUnlock()
 
 		hasher := sha256.New()
 		for _, block := range state.blocks {
 			buf = buf[:int(block.Size)]
 			found := p.model.finder.Iterate(block.Hash, func(folder, file string, index uint32) bool {
-				path := filepath.Join(p.model.folderCfgs[folder].Path, file)
-
-				var fd *os.File
-
-				fdi := fdCache.Get(path)
-				if fdi != nil {
-					fd = fdi.(*os.File)
-				} else {
-					fd, err = os.Open(path)
-					if err != nil {
-						return false
-					}
-					fdCache.Set(path, fd)
+				fd, err := p.model.openFile(filepath.Join(folderRoots[folder], file))
+				if err != nil {
+					return false
 				}
 
 				_, err = fd.ReadAt(buf, protocol.BlockSize*int64(index))
@@ -687,8 +669,7 @@ nextFile:
 				state.copyDone()
 			}
 		}
-		fdCache.Evict(fdCache.Len())
-		close(evictionChan)
+
 		out <- state.sharedPullerState
 	}
 }

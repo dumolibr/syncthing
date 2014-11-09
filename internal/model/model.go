@@ -30,6 +30,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/AudriusButkevicius/lfu-go"
+	"github.com/syndtr/goleveldb/leveldb"
+
 	"github.com/syncthing/syncthing/internal/config"
 	"github.com/syncthing/syncthing/internal/events"
 	"github.com/syncthing/syncthing/internal/files"
@@ -41,7 +44,6 @@ import (
 	"github.com/syncthing/syncthing/internal/stats"
 	"github.com/syncthing/syncthing/internal/symlinks"
 	"github.com/syncthing/syncthing/internal/versioner"
-	"github.com/syndtr/goleveldb/leveldb"
 )
 
 type folderState int
@@ -82,9 +84,10 @@ type service interface {
 }
 
 type Model struct {
-	cfg    *config.ConfigWrapper
-	db     *leveldb.DB
-	finder *files.BlockFinder
+	cfg     *config.ConfigWrapper
+	db      *leveldb.DB
+	finder  *files.BlockFinder
+	fdCache *lfu.Cache
 
 	deviceName    string
 	clientName    string
@@ -124,6 +127,8 @@ func NewModel(cfg *config.ConfigWrapper, deviceName, clientName, clientVersion s
 	m := &Model{
 		cfg:                cfg,
 		db:                 db,
+		finder:             files.NewBlockFinder(db, cfg),
+		fdCache:            lfu.New(),
 		deviceName:         deviceName,
 		clientName:         clientName,
 		clientVersion:      clientVersion,
@@ -139,8 +144,19 @@ func NewModel(cfg *config.ConfigWrapper, deviceName, clientName, clientVersion s
 		protoConn:          make(map[protocol.DeviceID]protocol.Connection),
 		rawConn:            make(map[protocol.DeviceID]io.Closer),
 		deviceVer:          make(map[protocol.DeviceID]string),
-		finder:             files.NewBlockFinder(db, cfg),
 	}
+
+	evictionChan := make(chan lfu.Eviction)
+
+	m.fdCache.UpperBound = 50
+	m.fdCache.LowerBound = 20
+	m.fdCache.EvictionChannel = evictionChan
+
+	go func() {
+		for item := range evictionChan {
+			item.Value.(*os.File).Close()
+		}
+	}()
 
 	var timeout = 20 * 60 // seconds
 	if t := os.Getenv("STDEADLOCKTIMEOUT"); len(t) > 0 {
@@ -684,7 +700,7 @@ func (m *Model) Request(deviceID protocol.DeviceID, folder, name string, offset 
 		}
 		reader = strings.NewReader(target)
 	} else {
-		reader, err = os.Open(fn) // XXX: Inefficient, should cache fd?
+		reader, err = m.openFile(fn)
 		if err != nil {
 			return nil, err
 		}
@@ -1315,6 +1331,22 @@ func (m *Model) availability(folder string, file string) []protocol.DeviceID {
 
 func (m *Model) String() string {
 	return fmt.Sprintf("model@%p", m)
+}
+
+// Opens the given file, and caches the fd for future reuse, eventually evicting
+// and closing the descriptor if it hasn't been used for a while.
+func (m *Model) openFile(path string) (*os.File, error) {
+	fdi := m.fdCache.Get(path)
+	if fdi != nil {
+		return fdi.(*os.File), nil
+	}
+
+	fd, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	m.fdCache.Set(path, fd)
+	return fd, nil
 }
 
 func (m *Model) leveldbPanicWorkaround() {
