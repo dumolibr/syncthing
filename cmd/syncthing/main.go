@@ -46,6 +46,7 @@ import (
 	"github.com/syncthing/syncthing/internal/model"
 	"github.com/syncthing/syncthing/internal/osutil"
 	"github.com/syncthing/syncthing/internal/protocol"
+	"github.com/syncthing/syncthing/internal/symlinks"
 	"github.com/syncthing/syncthing/internal/upgrade"
 	"github.com/syncthing/syncthing/internal/upnp"
 	"github.com/syndtr/goleveldb/leveldb"
@@ -505,6 +506,10 @@ func syncthingMain() {
 
 	if opts.UPnPEnabled {
 		setupUPnP()
+	}
+
+	if !symlinks.Supported {
+		l.Infoln("Symlink support not available - requires Administrator priviledges.")
 	}
 
 	// Routine to connect out to configured devices

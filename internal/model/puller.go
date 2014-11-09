@@ -20,6 +20,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io/ioutil"
 	"os"
 	"path/filepath"
 	"sync"
@@ -32,6 +33,7 @@ import (
 	"github.com/syncthing/syncthing/internal/osutil"
 	"github.com/syncthing/syncthing/internal/protocol"
 	"github.com/syncthing/syncthing/internal/scanner"
+	"github.com/syncthing/syncthing/internal/symlinks"
 	"github.com/syncthing/syncthing/internal/versioner"
 )
 
@@ -290,7 +292,7 @@ func (p *Puller) pullerIteration(ncopiers, npullers, nfinishers int, checksum bo
 
 	changed := 0
 
-	var deletions []protocol.FileInfo
+	var deletions, links []protocol.FileInfo
 
 	files.WithNeed(protocol.LocalDeviceID, func(intf protocol.FileIntf) bool {
 
@@ -312,10 +314,25 @@ func (p *Puller) pullerIteration(ncopiers, npullers, nfinishers int, checksum bo
 			l.Debugln(p, "handling", file.Name)
 		}
 
+		// Don't bother with symlinks if they are not supported.
+		if !symlinks.Supported && file.IsSymlink() {
+			p.model.updateLocal(p.folder, file)
+			return true
+		}
+
 		switch {
 		case file.IsDeleted():
-			// A deleted file or directory
+			// A deleted file, directory or symlink
 			deletions = append(deletions, file)
+		case file.IsSymlink():
+			// A symlink
+			// Needs to be handled after handling all the files as on Windows
+			// symlinks have different types for files and for directories, so
+			// we hope that by handling file and directory pulls first, we will
+			// will reduce the posibility of not having a valid target, just in
+			// case the symlink type is unset, in hopes of knowing the type of
+			// symlink we need to create.
+			links = append(links, file)
 		case file.IsDirectory():
 			// A new or changed directory
 			p.handleDir(file)
@@ -328,6 +345,10 @@ func (p *Puller) pullerIteration(ncopiers, npullers, nfinishers int, checksum bo
 		changed++
 		return true
 	})
+
+	for _, link := range links {
+		p.handleFile(link, copyChan, finisherChan)
+	}
 
 	// Signal copy and puller routines that we are done with the in data for
 	// this iteration. Wait for them to finish.
@@ -453,23 +474,20 @@ func (p *Puller) deleteFile(file protocol.FileInfo) {
 func (p *Puller) handleFile(file protocol.FileInfo, copyChan chan<- copyBlocksState, finisherChan chan<- *sharedPullerState) {
 	curFile := p.model.CurrentFolderFile(p.folder, file.Name)
 
-	if len(curFile.Blocks) == len(file.Blocks) {
-		for i := range file.Blocks {
-			if !bytes.Equal(curFile.Blocks[i].Hash, file.Blocks[i].Hash) {
-				goto FilesAreDifferent
-			}
-		}
+	if len(curFile.Blocks) == len(file.Blocks) && scanner.BlocksEqual(curFile.Blocks, file.Blocks) {
 		// We are supposed to copy the entire file, and then fetch nothing. We
 		// are only updating metadata, so we don't actually *need* to make the
 		// copy.
 		if debug {
 			l.Debugln(p, "taking shortcut on", file.Name)
 		}
-		p.shortcutFile(file)
+		if file.IsSymlink() {
+			p.shortcutSymlink(curFile, file)
+		} else {
+			p.shortcutFile(file)
+		}
 		return
 	}
-
-FilesAreDifferent:
 
 	scanner.PopulateOffsets(file.Blocks)
 
@@ -560,6 +578,17 @@ func (p *Puller) shortcutFile(file protocol.FileInfo) {
 			l.Infof("Puller (folder %q, file %q): shortcut: %v", p.folder, file.Name, err)
 			return
 		}
+	}
+
+	p.model.updateLocal(p.folder, file)
+}
+
+// shortcutSymlink changes the symlinks type if necessery.
+func (p *Puller) shortcutSymlink(curFile, file protocol.FileInfo) {
+	err := symlinks.ChangeType(filepath.Join(p.dir, file.Name), file.Flags)
+	if err != nil {
+		l.Infof("Puller (folder %q, file %q): symlink shortcut: %v", p.folder, file.Name, err)
+		return
 	}
 
 	p.model.updateLocal(p.folder, file)
@@ -776,6 +805,26 @@ func (p *Puller) finisherRoutine(in <-chan *sharedPullerState) {
 			if err != nil {
 				l.Warnln("puller: final:", err)
 				continue
+			}
+
+			// If it's a symlink, the target of the symlink is inside the file.
+			if state.file.IsSymlink() {
+				content, err := ioutil.ReadFile(state.realName)
+				if err != nil {
+					l.Warnln("puller: final: reading symlink:", err)
+					continue
+				}
+
+				// Remove the file, and replace it with a symlink.
+				err = osutil.InWritableDir(func(path string) error {
+					os.Remove(path)
+					return symlinks.Create(path, string(content), state.file.Flags)
+				}, state.realName)
+
+				if err != nil {
+					l.Warnln("puller: final: creating symlink:", err)
+					continue
+				}
 			}
 
 			// Record the updated file in the index

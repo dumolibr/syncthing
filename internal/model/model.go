@@ -39,6 +39,7 @@ import (
 	"github.com/syncthing/syncthing/internal/protocol"
 	"github.com/syncthing/syncthing/internal/scanner"
 	"github.com/syncthing/syncthing/internal/stats"
+	"github.com/syncthing/syncthing/internal/symlinks"
 	"github.com/syncthing/syncthing/internal/versioner"
 	"github.com/syndtr/goleveldb/leveldb"
 )
@@ -673,14 +674,26 @@ func (m *Model) Request(deviceID protocol.DeviceID, folder, name string, offset 
 	m.fmut.RLock()
 	fn := filepath.Join(m.folderCfgs[folder].Path, name)
 	m.fmut.RUnlock()
-	fd, err := os.Open(fn) // XXX: Inefficient, should cache fd?
-	if err != nil {
-		return nil, err
+
+	var reader io.ReaderAt
+	var err error
+	if lf.IsSymlink() {
+		target, _, err := symlinks.Read(fn)
+		if err != nil {
+			return nil, err
+		}
+		reader = strings.NewReader(target)
+	} else {
+		reader, err = os.Open(fn) // XXX: Inefficient, should cache fd?
+		if err != nil {
+			return nil, err
+		}
+
+		defer reader.(*os.File).Close()
 	}
-	defer fd.Close()
 
 	buf := make([]byte, size)
-	_, err = fd.ReadAt(buf, offset)
+	_, err = reader.ReadAt(buf, offset)
 	if err != nil {
 		return nil, err
 	}

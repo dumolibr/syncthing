@@ -27,6 +27,7 @@ import (
 	"github.com/syncthing/syncthing/internal/ignore"
 	"github.com/syncthing/syncthing/internal/lamport"
 	"github.com/syncthing/syncthing/internal/protocol"
+	"github.com/syncthing/syncthing/internal/symlinks"
 )
 
 type Walker struct {
@@ -129,6 +130,63 @@ func (w *Walker) walkAndHashFiles(fchan chan protocol.FileInfo) filepath.WalkFun
 		if (runtime.GOOS == "linux" || runtime.GOOS == "windows") && !norm.NFC.IsNormalString(rn) {
 			l.Warnf("File %q contains non-NFC UTF-8 sequences and cannot be synced. Consider renaming.", rn)
 			return nil
+		}
+
+		// We must perform this check, regardless of symlinks.Supported value
+		// as symlinks on Windows are always either .IsRegular or .IsDir, and we
+		// do not want to pick them up if we don't support them.
+		// Index wise symlinks are always files, regardless of what the target
+		// is, because symlinks carry their target path as their content.
+		isSymlink, _ := symlinks.IsSymlink(p)
+		if isSymlink {
+			// Do NOT descend down there, NO MATTER WHAT!
+			// Given this is a directory, this will cause files to get tracked,
+			// and removing the symlink will as a result remove files in their
+			// target location!
+			if !symlinks.Supported || w.CurrentFiler == nil {
+				return filepath.SkipDir
+			}
+			// We always rehash symlinks as they have no modtime or
+			// permissions.
+			// We check if they point to the old target by checking that
+			// their existing blocks match with the blocks in the index.
+			target, flags, err := symlinks.Read(p)
+			flags = flags & protocol.SymlinkTypeMask
+			if err != nil {
+				if debug {
+					l.Debugln("readlink error:", p, err)
+				}
+				return filepath.SkipDir
+			}
+
+			blocks, err := Blocks(strings.NewReader(target), w.BlockSize, 0)
+			if err != nil {
+				if debug {
+					l.Debugln("hash link error:", p, err)
+				}
+				return filepath.SkipDir
+			}
+
+			cf := w.CurrentFiler.CurrentFile(rn)
+			if !cf.IsDeleted() && cf.IsSymlink() && cf.Flags&protocol.SymlinkTypeMask == flags && BlocksEqual(cf.Blocks, blocks) {
+				return filepath.SkipDir
+			}
+
+			f := protocol.FileInfo{
+				Name:     rn,
+				Version:  lamport.Default.Tick(0),
+				Flags:    protocol.FlagSymlink | flags | protocol.FlagNoPermBits | 0666,
+				Modified: 0,
+				Blocks:   blocks,
+			}
+
+			if debug {
+				l.Debugln("symlink to hash:", p, f)
+			}
+
+			fchan <- f
+
+			return filepath.SkipDir
 		}
 
 		if info.Mode().IsDir() {
